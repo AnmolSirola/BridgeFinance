@@ -65,4 +65,32 @@ contract CrossChainLending {
 
         return (requestId, amount);
     }
+
+
+
+    function iAck(uint256 requestIdentifier, bool execFlag, bytes memory execData) external {
+        require(msg.sender == address(gatewayContract), "Only gateway");
+
+        (uint256 requestId, uint256 requestType) = abi.decode(execData, (uint256, uint256));
+
+        if (execFlag) {
+            if (requestType == 0) {
+                emit BorrowSuccess(requestId);
+            } else if (requestType == 1) {
+                emit RepaymentSuccess(requestId);
+            } else {
+                revert("Invalid request type");
+            }
+        } else {
+            if (requestType == 0) {
+                emit BorrowFailure(requestId);
+            } else if (requestType == 1) {
+                emit RepaymentFailure(requestId);
+            } else {
+                revert("Invalid request type");
+            }
+        }
+    
+    }
+
 }    
