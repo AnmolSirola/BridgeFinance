@@ -2,95 +2,170 @@
 pragma solidity ^0.8.0;
 
 import "@routerprotocol/evm-gateway-contracts/contracts/IGateway.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
 contract CrossChainLending {
-    address public owner;
-    uint256 public currentRequestId;
+    using SafeMath for uint256;
 
-    mapping(string => mapping(uint256 => uint256)) public borrowRequests;
-    mapping(string => mapping(uint256 => uint256)) public repaymentRequests;
-    mapping(uint256 => string) public borrowAcknowledgments;
-    mapping(uint256 => string) public repaymentAcknowledgments;
+    enum BorrowRequestStatus { Active, Repaid, Liquidated }
+
+    struct BorrowRequest {
+        address borrower;
+        uint256 amount;
+        uint256 interestRate;
+        address collateralToken;
+        BorrowRequestStatus status;
+        uint256 expiryTimestamp;
+    }
+
+    uint64 public currentRequestId;
+    mapping(uint64 => BorrowRequest) public borrowRequests;
+    mapping(address => uint256) public lendingBalances;
+    mapping(address => uint256) public collateralBalances;
+    address public owner;
 
     IGateway public gatewayContract;
 
-    event BorrowRequest(uint256 indexed requestId, string chainId, uint256 amount);
-    event BorrowSuccess(uint256 indexed requestId);
-    event BorrowFailure(uint256 indexed requestId);
-    event RepaymentRequest(uint256 indexed requestId, string chainId, uint256 amount);
-    event RepaymentSuccess(uint256 indexed requestId);
-    event RepaymentFailure(uint256 indexed requestId);
+    event BorrowCrossChain(uint64 indexed requestId, string destChainId, string asset, uint256 amount);
+    event BorrowCrossChainHandled(address indexed requestSender, string srcChainId, uint64 indexed requestId, string asset, uint256 amount);
+    event LendingRequestAcknowledgment(uint256 indexed requestIdentifier, bool execFlag, uint64 indexed requestId, string asset, uint256 amount);
+    event RepaymentRequestInitiated(uint64 indexed requestId, uint256 amount);
+    event RepaymentRequestReceived(string srcChainId, uint64 indexed requestId, uint256 amount);
+    event LiquidationRequestInitiated(uint64 indexed requestId);
+    event LiquidationRequestReceived(string srcChainId, uint64 indexed requestId);
+    event LoanRepaid(uint64 indexed requestId, address indexed borrower, uint256 amount);
+    event CollateralLiquidated(uint64 indexed requestId, address indexed borrower, address indexed liquidator, uint256 collateralAmount);
 
-    error CustomError(string message);
-
-    constructor(address payable gatewayAddress, string memory feePayerAddress) {
-        owner = msg.sender;
+    constructor(address payable gatewayAddress) {
         gatewayContract = IGateway(gatewayAddress);
-        gatewayContract.setDappMetadata(feePayerAddress);
-    }
-
-    function setDappMetadata(string memory feePayerAddress) external {
-        require(msg.sender == owner, "Only owner");
-        gatewayContract.setDappMetadata(feePayerAddress);
+        owner = msg.sender;
     }
 
     function setGateway(address gateway) external {
-        require(msg.sender == owner, "Only owner");
+        require(msg.sender == owner, "Only the owner can call this function");
         gatewayContract = IGateway(gateway);
     }
 
-    function borrow(uint256 amount) external {
+    function borrowCrossChain(
+        string calldata destChainId,
+        string calldata destinationContractAddress,
+        string calldata asset,
+        uint256 amount,
+        bytes calldata requestMetadata
+    ) external payable {
         currentRequestId++;
-        borrowRequests[gatewayContract.chainId()][currentRequestId] = amount;
-        emit BorrowRequest(currentRequestId, gatewayContract.chainId(), amount);
+
+        bytes memory packet = abi.encode(currentRequestId, asset, amount);
+        bytes memory requestPacket = abi.encode(destinationContractAddress, packet);
+
+        gatewayContract.iSend{value: msg.value}(
+            1, // Acknowledgment type: No acknowledgment
+            0, // Destination gas limit: 0 for unlimited
+            "", // Destination contract method signature: empty string for fallback
+            destChainId, // Destination chain ID
+            requestMetadata, // Request metadata
+            requestPacket // Encoded request packet
+        );
+
+        emit BorrowCrossChain(currentRequestId, destChainId, asset, amount);
     }
 
-    function repayment(uint256 requestId, uint256 amount) external {
-        repaymentRequests[gatewayContract.chainId()][requestId] = amount;
-        emit RepaymentRequest(requestId, gatewayContract.chainId(), amount);
+    function handleBorrowCrossChain(
+        address requestSender,
+        bytes calldata packet,
+        string calldata srcChainId
+    ) external returns (uint64, string memory, uint256) {
+        require(msg.sender == address(gatewayContract), "Only the gateway can call this function");
+
+        (uint64 requestId, string memory asset, uint256 amount) = abi.decode(packet, (uint64, string, uint256));
+
+        emit BorrowCrossChainHandled(requestSender, srcChainId, requestId, asset, amount);
+
+        return (requestId, asset, amount);
     }
 
-    function iReceive(string memory requestSender, bytes memory packet, string memory srcChainId) external returns (uint256, uint256) {
-        require(msg.sender == address(gatewayContract), "Only gateway");
+    function handleLendingRequestAcknowledgment(
+        uint256 requestIdentifier,
+        bool
+        execFlag,
+        uint64 requestId,
+        string calldata asset,
+        uint256 amount
+        ) external {
+        require(msg.sender == address(gatewayContract), "Only the gateway can call this function");
+            BorrowRequest storage request = borrowRequests[requestId];
+    require(request.status == BorrowRequestStatus.Active, "Invalid request status");
 
-        (uint256 requestId, uint256 requestType, uint256 amount) = abi.decode(packet, (uint256, uint256, uint256));
+    if (execFlag) {
+        // Update lending balances
+        lendingBalances[msg.sender] = lendingBalances[msg.sender].add(amount);
 
-        if (requestType == 0) {
-            borrowRequests[srcChainId][requestId] = amount;
-        } else if (requestType == 1) {
-            repaymentRequests[srcChainId][requestId] = amount;
-        } else {
-            revert("Invalid request type");
-        }
+        // Update request status
+        request.status = BorrowRequestStatus.Repaid;
 
-        return (requestId, amount);
+        emit LendingRequestAcknowledgment(requestIdentifier, execFlag, requestId, asset, amount);
+    } else {
+        // Trigger liquidation if acknowledgment is rejected
+        initiateLiquidation(requestId);
     }
+}
 
+function initiateRepayment(uint64 requestId, uint256 amount) external {
+    require(borrowRequests[requestId].borrower == msg.sender, "Only the borrower can initiate repayment");
 
+    require(borrowRequests[requestId].status == BorrowRequestStatus.Active, "Invalid request status");
 
-    function iAck(uint256 requestIdentifier, bool execFlag, bytes memory execData) external {
-        require(msg.sender == address(gatewayContract), "Only gateway");
+    IERC20 collateralToken = IERC20(borrowRequests[requestId].collateralToken);
 
-        (uint256 requestId, uint256 requestType) = abi.decode(execData, (uint256, uint256));
+    // Transfer repayment amount from the borrower to this contract
+    require(collateralToken.transferFrom(msg.sender, address(this), amount), "Repayment transfer failed");
 
-        if (execFlag) {
-            if (requestType == 0) {
-                emit BorrowSuccess(requestId);
-            } else if (requestType == 1) {
-                emit RepaymentSuccess(requestId);
-            } else {
-                revert("Invalid request type");
-            }
-        } else {
-            if (requestType == 0) {
-                emit BorrowFailure(requestId);
-            } else if (requestType == 1) {
-                emit RepaymentFailure(requestId);
-            } else {
-                revert("Invalid request type");
-            }
-        }
-    
+    emit RepaymentRequestInitiated(requestId, amount);
+}
+
+function handleRepaymentRequest(
+    string calldata srcChainId,
+    uint64 requestId,
+    uint256 amount
+) external {
+    require(msg.sender == address(gatewayContract), "Only the gateway can call this function");
+
+    BorrowRequest storage request = borrowRequests[requestId];
+    require(request.status == BorrowRequestStatus.Active, "Invalid request status");
+
+    // Update lending balances
+    lendingBalances[request.borrower] = lendingBalances[request.borrower].sub(amount);
+
+    // Update collateral balances
+    collateralBalances[request.collateralToken] = collateralBalances[request.collateralToken].sub(amount);
+
+    // Update request status
+    request.status = BorrowRequestStatus.Repaid;
+
+    emit RepaymentRequestReceived(srcChainId, requestId, amount);
+    emit LoanRepaid(requestId, request.borrower, amount);
+}
+
+function initiateLiquidation(uint64 requestId) public {
+    require(borrowRequests[requestId].status == BorrowRequestStatus.Active, "Invalid request status");
+
+    BorrowRequest storage request = borrowRequests[requestId];
+    IERC20 collateralToken = IERC20(request.collateralToken);
+
+    // Calculate the collateral amount to be liquidated (50% of the borrowed amount)
+    uint256 collateralAmount = request.amount.div(2);
+
+    // Update collateral balances
+    collateralBalances[request.collateralToken] = collateralBalances[request.collateralToken].sub(collateralAmount);
+
+    // Transfer collateral to the liquidator
+    require(collateralToken.transfer(msg.sender, collateralAmount), "Collateral transfer failed");
+
+    // Update request status
+    request.status = BorrowRequestStatus.Liquidated;
+
+    emit LiquidationRequestInitiated(requestId);
+    emit CollateralLiquidated(requestId, request.borrower, msg.sender, collateralAmount);
     }
-
-}    
+}         
