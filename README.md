@@ -15,10 +15,10 @@ BridgeFinance is a decentralized lending platform that enables seamless borrowin
 
 ### Prerequisites
 
-- Node.js (version X.X.X)
-- npm (version X.X.X)
-- Web3.js (version X.X.X)
-- Solidity (version X.X.X)
+- Node.js - 19.6.0
+- npm - 8.5.4
+- Web3.js - 4.0.1
+- Solidity - 0.8.12
 
 ### Installation
 
