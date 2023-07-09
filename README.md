@@ -51,8 +51,6 @@ Please ensure that your contributions adhere to the project's coding standards a
 
 This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).
 
-## Contact
 
-For any inquiries or feedback, please contact us at [anmolsirola57@gmail.com](mailto:anmolsirola57@gmail.com).
 
 
