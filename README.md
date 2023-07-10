@@ -49,7 +49,7 @@ Please ensure that your contributions adhere to the project's coding standards a
 
 ## License
 
-This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).
+This project is licensed under the 
 
 
 
