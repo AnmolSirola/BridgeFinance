@@ -52,3 +52,4 @@ describe("CrossChainLending", function () {
     const destinationContractAddress = "destinationContractAddress";
     const asset = "asset";
     const amount = 100;
+  });
